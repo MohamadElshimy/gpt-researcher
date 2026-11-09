@@ -24,6 +24,7 @@ pytestmark = pytest.mark.timeout(180)
 
 FACTORY = "tests.pdf_router.fake_backends:registry"
 BROKEN_FACTORY = "tests.pdf_router.fake_backends:broken_registry"
+DYING_FACTORY = "tests.pdf_router.fake_backends:dying_registry"
 BACKENDS = ("echo", "sleep", "crash", "raising")
 
 
@@ -136,18 +137,50 @@ def test_startup_failure_is_reported_as_worker_startup_error():
         pool.shutdown()
 
 
-def test_pooled_executor_degrades_to_inline_when_workers_cannot_start():
+def test_deterministic_startup_failure_degrades_light_tier_inline_and_disables_heavy():
     settings = RouterSettings(light_workers=1, heavy_workers=1, worker_idle_secs=0)
     executor = PooledExecutor(settings, registry=fake_registry(), registry_factory=BROKEN_FACTORY)
     try:
         result = executor.run("echo", b"", [0], timeout=30)
         assert executor.degraded is True
         assert executor.max_concurrency == 1
-        assert pid_of(result) == os.getpid()  # ran in this process
-        # Subsequent calls stay inline without trying to spawn again.
+        assert pid_of(result) == os.getpid()  # light tier ran in this process
+        # Heavy tiers never run in-process automatically: pages fall back to plain text instead.
+        with pytest.raises(BackendUnavailable, match="PDF_ROUTER_INLINE"):
+            executor.run("raising", b"", [0], timeout=30)
+        # Subsequent light calls stay inline without trying to spawn again.
         assert pid_of(executor.run("echo", b"", [0], timeout=30)) == os.getpid()
     finally:
         executor.shutdown()
+
+
+def test_transient_startup_failure_sets_a_cooldown_instead_of_latching(monkeypatch):
+    monkeypatch.setattr("gpt_researcher.scraper.pdf_router.workers.spawn_possible", lambda: True)
+    settings = RouterSettings(light_workers=1, heavy_workers=1, worker_idle_secs=0)
+    executor = PooledExecutor(settings, registry=fake_registry(), registry_factory=DYING_FACTORY)
+    try:
+        result = executor.run("echo", b"", [0], timeout=30)
+        assert executor.degraded is False
+        assert executor.retry_after > time.monotonic()
+        assert pid_of(result) == os.getpid()
+        with pytest.raises(BackendUnavailable):
+            executor.run("raising", b"", [0], timeout=30)
+        # Within the cool-down no spawn is attempted (would take a handshake round-trip otherwise).
+        t0 = time.monotonic()
+        executor.run("echo", b"", [0], timeout=30)
+        assert time.monotonic() - t0 < 0.5
+    finally:
+        executor.shutdown()
+
+
+def test_startup_error_flags_determinism():
+    pool = MLWorkerPool("broken", BACKENDS, 1, RouterSettings(worker_idle_secs=0), registry_factory=BROKEN_FACTORY)
+    try:
+        with pytest.raises(WorkerStartupError) as info:
+            pool.run("echo", b"", [0], timeout=30)
+        assert info.value.deterministic is True
+    finally:
+        pool.shutdown()
 
 
 def test_pooled_executor_routes_tiers_to_pools():

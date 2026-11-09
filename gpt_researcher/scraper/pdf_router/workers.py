@@ -26,6 +26,7 @@ import importlib
 import logging
 import multiprocessing as mp
 import os
+import sys
 import threading
 import time
 from typing import Iterable, Sequence
@@ -83,8 +84,26 @@ def _worker_main(conn, backend_names: tuple[str, ...], registry_factory: str) ->
 
 class WorkerStartupError(BackendCrashed):
     """The sidecar process could not be started or died before saying hello.
-    Typical causes: the interpreter's ``__main__`` is not importable (stdin,
-    some notebooks), or the environment forbids subprocesses."""
+
+    ``deterministic`` is True when retrying cannot help: the child reported
+    that the backend registry does not import, or the interpreter's
+    ``__main__`` has no importable file (stdin, some notebooks) so every
+    ``spawn`` will fail the same way. Everything else (resource exhaustion,
+    a slow host) is treated as transient."""
+
+    def __init__(self, message: str, deterministic: bool = False):
+        super().__init__(message)
+        self.deterministic = deterministic
+
+
+def spawn_possible() -> bool:
+    """False when multiprocessing's spawn bootstrap would fail to re-import
+    ``__main__`` in every child (``python -`` sets ``__file__`` to ``<stdin>``)."""
+    main = sys.modules.get("__main__")
+    path = getattr(main, "__file__", None)
+    if not path:
+        return True
+    return os.path.exists(path)
 
 
 class _Worker:
@@ -112,13 +131,17 @@ class _Worker:
         except (EOFError, OSError) as exc:
             code = self.proc.exitcode
             self.kill()
-            raise WorkerStartupError(f"{self.proc.name}: died during startup (exit code {code})") from exc
+            raise WorkerStartupError(
+                f"{self.proc.name}: died during startup (exit code {code})",
+                deterministic=not spawn_possible(),
+            ) from exc
         except WorkerStartupError:
             self.kill()
             raise
         if status != "ready":
             self.kill()
-            raise WorkerStartupError(f"{self.proc.name}: {status} {detail}")
+            # The child itself reported that the registry does not import: no retry will fix it.
+            raise WorkerStartupError(f"{self.proc.name}: {status} {detail}", deterministic=(status == "startup-error"))
 
     def alive(self) -> bool:
         return self.proc.is_alive()
@@ -343,10 +366,17 @@ class MLWorkerPool:
 class PooledExecutor:
     """Routes layout-tier tasks to a light pool and Docling tasks to a heavy pool.
 
-    If sidecar processes cannot be started at all in this environment (no
-    importable ``__main__``, subprocesses forbidden), the executor degrades to
-    serialised in-process execution once, with a warning, instead of failing
-    every page. Timeouts and crash isolation are lost in that mode."""
+    Fail-closed when sidecars cannot start: the heavy tier (Docling, untrusted
+    PDFs through torch/ONNX) is reported unavailable so those pages fall back
+    to plain text; the light tier (pymupdf, the same library already running
+    in the scraper threads) runs in-process, serialised. A deterministic
+    startup failure (``__main__`` not importable, registry does not import)
+    latches that mode; a transient one is retried after a growing cool-down
+    (15 s doubling to 5 min). ``PDF_ROUTER_INLINE=1`` is the explicit opt-in
+    for running every tier in-process."""
+
+    COOLDOWN_BASE = 15.0
+    COOLDOWN_MAX = 300.0
 
     def __init__(
         self,
@@ -369,31 +399,54 @@ class PooledExecutor:
             self.pools.append(pool)
             self._pools.update({name: pool for name in heavy})
         self.max_concurrency = sum(p.size for p in self.pools) or 1
-        self.degraded = False
+        self.degraded = False  # deterministic: sidecars can never start in this process
+        self.retry_after = 0.0  # transient: monotonic time before spawning is attempted again
+        self._startup_failures = 0
         self._inline_lock = threading.Lock()
 
     def run(self, backend_name, pdf_bytes, page_numbers, timeout):
-        if self.degraded:
-            return self._run_inline(backend_name, pdf_bytes, page_numbers)
         pool = self._pools.get(backend_name)
         if pool is None:
             raise BackendUnavailable(f"{backend_name}: no worker pool serves this backend")
+        if self.degraded or time.monotonic() < self.retry_after:
+            return self._run_degraded(backend_name, pdf_bytes, page_numbers)
         try:
-            return pool.run(backend_name, pdf_bytes, page_numbers, timeout)
+            result = pool.run(backend_name, pdf_bytes, page_numbers, timeout)
         except WorkerStartupError as exc:
+            self._note_startup_failure(exc)
+            return self._run_degraded(backend_name, pdf_bytes, page_numbers)
+        self._startup_failures = 0
+        return result
+
+    def _note_startup_failure(self, exc: WorkerStartupError) -> None:
+        self._startup_failures += 1
+        if exc.deterministic:
             if not self.degraded:
                 self.degraded = True
                 self.max_concurrency = 1
                 logger.warning(
-                    "pdf_router: sidecar workers cannot start here (%s); running ML tiers "
-                    "in-process without timeouts or crash isolation",
+                    "pdf_router: sidecar workers cannot start in this process (%s); light tier runs "
+                    "in-process, heavy tier disabled. Set PDF_ROUTER_INLINE=1 to run every tier in-process.",
                     exc,
                 )
-            return self._run_inline(backend_name, pdf_bytes, page_numbers)
+            return
+        cooldown = min(self.COOLDOWN_MAX, self.COOLDOWN_BASE * 2 ** min(self._startup_failures - 1, 6))
+        self.retry_after = time.monotonic() + cooldown
+        logger.warning(
+            "pdf_router: sidecar worker failed to start (%s); retrying in %.0fs, heavy tier unavailable meanwhile",
+            exc,
+            cooldown,
+        )
 
-    def _run_inline(self, backend_name, pdf_bytes, page_numbers):
+    def _run_degraded(self, backend_name, pdf_bytes, page_numbers):
+        backend = self._registry.get(backend_name)
+        if backend.tier >= 2:
+            raise BackendUnavailable(
+                f"{backend_name}: sidecar workers unavailable and heavy tiers never run in-process "
+                "automatically (set PDF_ROUTER_INLINE=1 to allow it)"
+            )
         with self._inline_lock:  # PyMuPDF is not thread-safe
-            return self._registry.get(backend_name).parse(pdf_bytes, list(page_numbers))
+            return backend.parse(pdf_bytes, list(page_numbers))
 
     def shutdown(self) -> None:
         for pool in self.pools:

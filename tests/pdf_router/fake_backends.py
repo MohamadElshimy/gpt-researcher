@@ -121,3 +121,7 @@ def registry() -> BackendRegistry:
 
 def broken_registry() -> BackendRegistry:
     raise RuntimeError("registry factory exploded on purpose")
+
+
+def dying_registry() -> BackendRegistry:
+    os._exit(7)  # the child dies before the handshake, like an OOM kill during model import

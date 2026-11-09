@@ -77,6 +77,8 @@ class RoutedDocument:
 
 
 class PageRouter:
+    MIN_TASK_SECONDS = 1.0  # below this much remaining budget, do not start new ML tasks
+
     def __init__(
         self,
         settings: RouterSettings | None = None,
@@ -232,11 +234,22 @@ class PageRouter:
 
         results: dict[int, PageResult] = {}
         failures: dict[int, tuple[str, str]] = {}
+        remaining = deadline - time.monotonic()
+        if remaining < self.MIN_TASK_SECONDS:
+            for backend, run in tasks:
+                for p in run:
+                    failures[p] = (backend.name, "document deadline reached")
+            return results, failures
         workers = max(1, min(len(tasks), self.executor.max_concurrency))
         pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pdf-router")
         try:
+            # Clamp every task timeout to the document deadline so a sidecar
+            # task cannot outlive the document it serves: when the deadline
+            # passes, the worker is killed, not left running to its own limit.
             futures = {
-                pool.submit(self.executor.run, backend.name, pdf_bytes, run, self._timeout_for(backend)): (backend, run)
+                pool.submit(
+                    self.executor.run, backend.name, pdf_bytes, run, min(self._timeout_for(backend), remaining)
+                ): (backend, run)
                 for backend, run in tasks
             }
             done, not_done = wait(futures, timeout=max(0.0, deadline - time.monotonic()))

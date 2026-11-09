@@ -177,13 +177,43 @@ def test_timeout_from_executor_is_a_fallback(pdf_builder):
     assert any("BackendTimeout" in a for a in doc.pages[0].attempts)
 
 
+def test_task_timeout_is_clamped_to_the_document_deadline(pdf_builder):
+    pdf = pdf_builder("t")
+    layout = FakeBackend("layout", 1, LAYOUT_HANDLES, default=keep_text(pdf, GOOD_TABLE))
+    registry = BackendRegistry([PlainPyMuPDFBackend(), layout])
+    seen: list[float] = []
+
+    class RecordingExecutor:
+        max_concurrency = 1
+
+        def run(self, name, pdf_bytes, pages, timeout):
+            seen.append(timeout)
+            return registry.get(name).parse(pdf_bytes, pages)
+
+    router = PageRouter(
+        settings=RouterSettings(inline=True, light_timeout=30.0, doc_deadline=5.0),
+        executor=RecordingExecutor(),
+        registry=registry,
+    )
+    router.route(pdf)
+    assert seen and all(t <= 5.0 for t in seen), seen  # sidecar kills the worker at the document deadline
+
+
+def test_no_new_ml_tasks_start_when_the_deadline_is_nearly_spent(pdf_builder):
+    pdf = pdf_builder("t")
+    layout = FakeBackend("layout", 1, LAYOUT_HANDLES, default=keep_text(pdf, GOOD_TABLE))
+    doc = make_router(pdf, layout, doc_deadline=0.5).route(pdf)
+    assert layout.calls == []
+    assert any("deadline" in a for a in doc.pages[0].attempts)
+
+
 def test_document_deadline_stops_waiting(pdf_builder):
     pdf = pdf_builder("tt")
-    layout = FakeBackend("layout", 1, LAYOUT_HANDLES, default=keep_text(pdf, GOOD_TABLE), delay=0.6)
-    doc = make_router(pdf, layout, doc_deadline=0.2).route(pdf)
+    layout = FakeBackend("layout", 1, LAYOUT_HANDLES, default=keep_text(pdf, GOOD_TABLE), delay=3.0)
+    doc = make_router(pdf, layout, doc_deadline=1.2).route(pdf)
     assert all(p.backend == "plain" for p in doc.pages)
     assert any("deadline" in a for p in doc.pages for a in p.attempts)
-    assert doc.elapsed < 2.0
+    assert doc.elapsed < 2.5
 
 
 # --------------------------------------------------------------------------- budgets and switches
