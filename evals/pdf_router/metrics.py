@@ -37,7 +37,7 @@ LIGATURES = {
     "\u2014": "-",
     "\u00a0": " ",
 }
-_HTML_TAG = re.compile(r"</?(br|sup|sub|b|i|u|em|strong|span|td|tr|th|table|tbody|thead|p|div)\b[^<>]{0,40}>", re.I)
+_HTML_TAG = re.compile(r"</?(br|sup|sub|b|i|u|em|strong|span|td|tr|th|table|tbody|thead|p|div)\b[^<>]{0,40}>", re.IGNORECASE)
 
 
 def normalise(text: str) -> str:
