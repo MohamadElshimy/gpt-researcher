@@ -1,8 +1,17 @@
-import os
-import requests
-import tempfile
+"""PDF scraper: downloads the document (unchanged) and hands the bytes to the
+page router, which picks a parser backend per page and returns one Markdown
+string. The scraper contract -- ``scrape() -> (content, image_urls, title)`` --
+is unchanged, so nothing downstream needs to change.
+"""
+
+import logging
 from urllib.parse import urlparse
-from langchain_community.document_loaders import PyMuPDFLoader
+
+import requests
+
+from gpt_researcher.scraper.pdf_router import RouterSettings, route_pdf_detailed
+
+logger = logging.getLogger(__name__)
 
 
 class PyMuPDFScraper:
@@ -17,6 +26,7 @@ class PyMuPDFScraper:
         """
         self.link = link
         self.session = session
+        self.failure_reason = None
 
     def is_url(self) -> bool:
         """
@@ -33,55 +43,65 @@ class PyMuPDFScraper:
 
     def scrape(self) -> tuple[str, list[str], str]:
         """
-        The `scrape` function uses PyMuPDFLoader to load a document from the provided link (either URL or local file)
-        and returns the document as a string.
+        Download the PDF (URL) or read it (local path), route every page to the
+        cheapest parser that can handle it, and return the recombined Markdown.
 
         Returns:
-          str: A string representation of the loaded document.
+          tuple[str, list[str], str]: (content, image_urls, title). On any
+          failure the empty-result contract ``("", [], "")`` is kept and
+          ``self.failure_reason`` says why.
         """
         try:
-            if self.is_url():
-                http = self.session or requests
-                try:
-                    response = http.get(self.link, timeout=(5, 30), stream=True)
-                    response.raise_for_status()
-                except requests.exceptions.SSLError:
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        f"SSL verification failed for {self.link}, retrying without verification"
-                    )
-                    response = http.get(self.link, timeout=(5, 30), stream=True, verify=False)
-                    response.raise_for_status()
-
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-                    temp_filename = temp_file.name  # Get the temporary file name
-                    for chunk in response.iter_content(chunk_size=8192):
-                        temp_file.write(chunk)  # Write the downloaded content to the temporary file
-
-                # Always clean up the downloaded temp file, even if loading fails
-                # (PyMuPDFLoader.load() can raise on a malformed/partial PDF).
-                try:
-                    loader = PyMuPDFLoader(temp_filename)
-                    doc = loader.load()
-                finally:
-                    try:
-                        os.remove(temp_filename)
-                    except OSError:
-                        pass
-            else:
-                loader = PyMuPDFLoader(self.link)
-                doc = loader.load()
-
-            # Extract the content, image (if any), and title from the document.
-            image = []
-            # Retrieve content from ALL pages to ensure PDFs with cover pages pass validation.
-            content = "\n".join(page.page_content for page in doc)
-            title = doc[0].metadata.get("title", "") if doc else ""
-            return content, image, title
-
+            pdf_bytes = self._fetch_bytes()
         except requests.exceptions.Timeout:
-            print(f"Download timed out. Please check the link : {self.link}")
+            logger.warning("Download timed out. Please check the link : %s", self.link)
+            self.failure_reason = "PDF download timed out"
             return "", [], ""
         except Exception as e:
-            print(f"Error loading PDF : {self.link} {e}")
+            logger.warning("Error downloading PDF : %s %s", self.link, e)
+            self.failure_reason = f"PDF download failed: {e}"
             return "", [], ""
+
+        try:
+            routed = route_pdf_detailed(pdf_bytes, self.link)
+        except Exception as e:
+            # Malformed or non-PDF bytes: keep the historical empty-result contract.
+            logger.warning("Error loading PDF : %s %s", self.link, e)
+            self.failure_reason = f"PDF could not be parsed: {e}"
+            return "", [], ""
+
+        if not routed.markdown:
+            self.failure_reason = "; ".join(routed.notes) or "PDF had no extractable text"
+        return routed.markdown, [], routed.title
+
+    # ------------------------------------------------------------------ fetch
+    def _fetch_bytes(self) -> bytes:
+        limit = RouterSettings.from_env().max_pdf_bytes
+        if not self.is_url():
+            with open(self.link, "rb") as f:
+                data = f.read(limit + 1)
+            if len(data) > limit:
+                raise ValueError(f"PDF larger than {limit} bytes")
+            return data
+
+        http = self.session or requests
+        try:
+            response = http.get(self.link, timeout=(5, 30), stream=True)
+            response.raise_for_status()
+        except requests.exceptions.SSLError:
+            logger.warning("SSL verification failed for %s, retrying without verification", self.link)
+            response = http.get(self.link, timeout=(5, 30), stream=True, verify=False)
+            response.raise_for_status()
+
+        declared = response.headers.get("Content-Length") if hasattr(response, "headers") else None
+        if declared and declared.isdigit() and int(declared) > limit:
+            raise ValueError(f"PDF larger than {limit} bytes (Content-Length {declared})")
+
+        buf = bytearray()
+        for chunk in response.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if len(buf) > limit:
+                raise ValueError(f"PDF larger than {limit} bytes")
+        return bytes(buf)

@@ -62,3 +62,7 @@ CURSOR_RULES.md
 
 # Local context filter benchmark inputs (scraped pages)
 /evals/context_filter/runs/
+
+# PDF router evaluation caches
+evals/pdf_router/.gt_cache/
+evals/pdf_router/out/

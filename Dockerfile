@@ -34,6 +34,10 @@ RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt --upgrade --prefer-binary && \
     pip install --no-cache-dir -r multi_agents/requirements.txt --upgrade --prefer-binary
 
+# Pre-fetch the PDF router's Docling weights (~400 MB) so the first scanned or
+# table-heavy PDF inside a research run does not block on a model download.
+RUN docling-tools models download layout tableformer rapidocr
+
 # Stage 3: Final stage with non-root user and app
 FROM gpt-researcher-install AS gpt-researcher
 

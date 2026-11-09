@@ -117,7 +117,7 @@ dependencies = [
     "pydantic-core>=2.33.2",
     "pydantic-settings>=2.9.1",
     "pydyf>=0.11.0",
-    "pymupdf>=1.26.0",
+    "pymupdf>=2.1",  # 2.x bundles the layout analyser used by the PDF router; 2.1 imports it lazily
     "pypdf>=5.5.0",
     "pyphen>=0.17.2",
     "python-docx>=1.1.2",
@@ -194,6 +194,14 @@ requirements-txt = [
     "playwright",
     "scrapy",
     "selenium",
+]
+# Rich PDF parsing tier for the page router (Docling: layout model, TableFormer,
+# OCR). ~3 GB with torch plus ~400 MB of weights; without it the router degrades
+# to the plain and layout tiers and logs a warning. Install with:
+#   pip install "gpt-researcher[pdf-rich]"
+#   docling-tools models download layout tableformer rapidocr
+pdf-rich = [
+    "docling>=2.139",  # >=2.139 fixes the per-conversion thread/memory leak; >=2.60 thread-safe converter
 ]
 # Optional agent observability via Monocle. Install with:
 #   pip install "gpt-researcher[monocle]"

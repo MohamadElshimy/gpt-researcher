@@ -31,7 +31,8 @@ arxiv>=2.0.0
 # Document Processing
 beautifulsoup4>=4.12.2
 brotli>=1.2.0  # < 1.2.0 has no decompression size limit (CVE-2025-6176 decompression-bomb DoS)
-pymupdf>=1.23.6
+pymupdf>=2.1  # bundles the layout analyser used by gpt_researcher/scraper/pdf_router
+docling>=2.139  # rich PDF tier (layout model + TableFormer + OCR); optional for library installs, see pyproject [pdf-rich]
 python-docx>=1.1.0
 python-pptx>=1.0.2
 unstructured>=0.13
