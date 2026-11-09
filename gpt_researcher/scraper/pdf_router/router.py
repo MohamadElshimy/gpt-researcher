@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from typing import Protocol, Sequence
+from typing import Protocol
 
 import pymupdf
 
@@ -30,6 +31,8 @@ from .settings import RouterSettings
 
 logger = logging.getLogger(__name__)
 
+DEADLINE_REASON = "document deadline reached"
+
 
 class BackendExecutor(Protocol):
     max_concurrency: int
@@ -37,12 +40,15 @@ class BackendExecutor(Protocol):
     def run(
         self, backend_name: str, pdf_bytes: bytes, page_numbers: Sequence[int], timeout: float
     ) -> dict[int, PageResult]:
-        """Run one backend task; raise BackendError on failure."""
+        """Run one backend task within ``timeout`` seconds; raise BackendError on failure."""
 
 
 class InlineExecutor:
-    """Runs backends in the calling thread. PyMuPDF is not thread-safe, so
-    inline execution is serialised (max_concurrency = 1)."""
+    """Runs backends in the calling thread, one task at a time per ``route()``
+    call (max_concurrency = 1). Concurrent ``route()`` calls on separate
+    threads are not serialised against each other, and PyMuPDF is not
+    thread-safe: inline execution is for tests, evaluation and explicit
+    ``PDF_ROUTER_INLINE=1`` opt-in, not the scraper's default."""
 
     max_concurrency = 1
 
@@ -51,6 +57,10 @@ class InlineExecutor:
 
     def run(self, backend_name, pdf_bytes, page_numbers, timeout):
         return self.registry.get(backend_name).parse(pdf_bytes, list(page_numbers))
+
+
+class _DeadlineReached(BackendError):
+    """Raised inside a task that was dequeued after the document deadline."""
 
 
 @dataclass
@@ -62,6 +72,7 @@ class RoutedPage:
     markdown: str
     confidence: float | None = None
     attempts: list[str] = field(default_factory=list)
+    ml_attempted: bool = False
 
 
 @dataclass
@@ -121,6 +132,12 @@ class PageRouter:
     def _timeout_for(self, backend: PageBackend) -> float:
         return self.settings.heavy_timeout if backend.tier >= 2 else self.settings.light_timeout
 
+    def _batch_for(self, backend: PageBackend) -> int:
+        explicit = getattr(backend, "batch_pages", None)
+        if explicit:
+            return max(1, int(explicit))
+        return max(1, self.settings.docling_run_size if backend.tier >= 2 else self.settings.layout_run_size)
+
     # ------------------------------------------------------------------ main
     def route_text(self, pdf_bytes: bytes, source_url: str = "") -> str:
         return self.route(pdf_bytes, source_url).markdown
@@ -142,16 +159,13 @@ class PageRouter:
         pages: dict[int, RoutedPage] = {}
         for p in range(n):
             tri = triage.get(p)
-            page = RoutedPage(
+            pages[p] = RoutedPage(
                 page_no=p,
                 page_class=tri.page_class if tri else PageClass.PLAIN,
                 signals=tri.signals if tri else None,
                 backend=self.base.name,
                 markdown=base_results[p].markdown,
             )
-            if tri is None:
-                page.attempts.append("beyond triage page cap")
-            pages[p] = page
         if n > s.max_triage_pages:
             notes.append(f"{n - s.max_triage_pages} pages beyond the triage cap kept on {self.base.name}")
 
@@ -178,49 +192,61 @@ class PageRouter:
                 pages[p].attempts.append("ML page budget exhausted")
                 del targets[p]
             notes.append(f"ML page budget: {len(dropped)} pages kept on {self.base.name}")
+        for p in targets:
+            pages[p].ml_attempted = True
 
         # ---- execute rounds: run, gate, escalate one tier, repeat
         pending = targets
         while pending:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if time.monotonic() >= deadline:
                 for p in pending:
-                    pages[p].attempts.append("document deadline reached before scheduling")
+                    pages[p].attempts.append(f"{DEADLINE_REASON} before scheduling")
                 notes.append(f"document deadline ({s.doc_deadline:.0f}s) reached")
                 break
             results, failures = self._run_round(pdf_bytes, pending, deadline)
             next_round: dict[int, PageBackend] = {}
 
-            for p, result in results.items():
+            for p, (backend, result) in results.items():
                 page = pages[p]
-                backend = self.registry.get(result.backend)
                 ok, reasons = self._gate(page, result, base_results[p].markdown)
                 if ok:
                     self._accept(page, result)
                     continue
-                page.attempts.append(f"{result.backend}: gate failed ({'; '.join(reasons)})")
+                page.attempts.append(f"{backend.name}: gate failed ({'; '.join(reasons)})")
+                self._accept_provisional(page, result, reasons)
                 higher = self._pick(page.page_class, above_tier=backend.tier)
                 if higher is not None:
                     next_round[p] = higher
-                    self._accept_provisional(page, result, reasons)
-                else:
-                    self._accept_provisional(page, result, reasons)
 
-            for p, (backend_name, reason) in failures.items():
+            deadline_hit = False
+            for p, (backend, reason) in failures.items():
                 page = pages[p]
-                page.attempts.append(f"{backend_name}: {reason}")
-                backend = self.registry.get(backend_name)
+                page.attempts.append(f"{backend.name}: {reason}")
+                if reason == DEADLINE_REASON:
+                    deadline_hit = True
+                    continue  # terminal: no point escalating a page we have no time for
                 higher = self._pick(page.page_class, above_tier=backend.tier)
-                if higher is not None and time.monotonic() < deadline:
+                if higher is not None:
                     next_round[p] = higher
+            if deadline_hit and not any(n.startswith("document deadline") for n in notes):
+                notes.append(f"document deadline ({s.doc_deadline:.0f}s) reached")
             pending = next_round
 
         return self._finish(source_url, title, pages, t0, notes)
 
     # ------------------------------------------------------------------ rounds
+    def _execute(self, backend: PageBackend, pdf_bytes: bytes, run: list[int], deadline: float) -> dict[int, PageResult]:
+        """Runs on a pool thread. The budget is computed when the task actually
+        starts (queued tasks start later than they were submitted), so a sidecar
+        task can never outlive the document it serves."""
+        budget = deadline - time.monotonic()
+        if budget < self.MIN_TASK_SECONDS:
+            raise _DeadlineReached(DEADLINE_REASON)
+        return self.executor.run(backend.name, pdf_bytes, run, min(self._timeout_for(backend), budget))
+
     def _run_round(
         self, pdf_bytes: bytes, pending: dict[int, PageBackend], deadline: float
-    ) -> tuple[dict[int, PageResult], dict[int, tuple[str, str]]]:
+    ) -> tuple[dict[int, tuple[PageBackend, PageResult]], dict[int, tuple[PageBackend, str]]]:
         by_backend: dict[str, list[int]] = {}
         for p, backend in pending.items():
             by_backend.setdefault(backend.name, []).append(p)
@@ -228,54 +254,51 @@ class PageRouter:
         tasks: list[tuple[PageBackend, list[int]]] = []
         for name, page_list in by_backend.items():
             backend = self.registry.get(name)
-            batch = max(1, int(getattr(backend, "batch_pages", 1)))
-            for run in contiguous_runs(page_list, max_len=batch):
+            for run in contiguous_runs(page_list, max_len=self._batch_for(backend)):
                 tasks.append((backend, run))
 
-        results: dict[int, PageResult] = {}
-        failures: dict[int, tuple[str, str]] = {}
-        remaining = deadline - time.monotonic()
-        if remaining < self.MIN_TASK_SECONDS:
+        results: dict[int, tuple[PageBackend, PageResult]] = {}
+        failures: dict[int, tuple[PageBackend, str]] = {}
+        if deadline - time.monotonic() < self.MIN_TASK_SECONDS:
             for backend, run in tasks:
                 for p in run:
-                    failures[p] = (backend.name, "document deadline reached")
+                    failures[p] = (backend, DEADLINE_REASON)
             return results, failures
+
         workers = max(1, min(len(tasks), self.executor.max_concurrency))
         pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pdf-router")
         try:
-            # Clamp every task timeout to the document deadline so a sidecar
-            # task cannot outlive the document it serves: when the deadline
-            # passes, the worker is killed, not left running to its own limit.
-            futures = {
-                pool.submit(
-                    self.executor.run, backend.name, pdf_bytes, run, min(self._timeout_for(backend), remaining)
-                ): (backend, run)
-                for backend, run in tasks
-            }
+            futures = {pool.submit(self._execute, backend, pdf_bytes, run, deadline): (backend, run) for backend, run in tasks}
             done, not_done = wait(futures, timeout=max(0.0, deadline - time.monotonic()))
             for fut in done:
                 backend, run = futures[fut]
                 try:
                     out = fut.result()
+                except _DeadlineReached:
+                    for p in run:
+                        failures[p] = (backend, DEADLINE_REASON)
+                    continue
                 except BackendError as exc:
                     for p in run:
-                        failures[p] = (backend.name, f"{type(exc).__name__}: {exc}")
+                        failures[p] = (backend, f"{type(exc).__name__}: {exc}")
                     continue
                 except Exception as exc:  # a backend bug must never take the document down
                     logger.exception("pdf_router: backend %s raised", backend.name)
                     for p in run:
-                        failures[p] = (backend.name, f"unexpected {type(exc).__name__}: {exc}")
+                        failures[p] = (backend, f"unexpected {type(exc).__name__}: {exc}")
                     continue
                 for p in run:
                     if p in out:
-                        results[p] = out[p]
+                        results[p] = (backend, out[p])
                     else:
-                        failures[p] = (backend.name, "no result for page")
+                        failures[p] = (backend, "no result for page")
             for fut in not_done:
                 backend, run = futures[fut]
                 for p in run:
-                    failures[p] = (backend.name, "document deadline reached")
+                    failures[p] = (backend, DEADLINE_REASON)
         finally:
+            # Running tasks cannot be cancelled here; their own budget (clamped
+            # to the deadline in _execute) ends them, killing the sidecar worker.
             pool.shutdown(wait=False, cancel_futures=True)
         return results, failures
 
@@ -290,8 +313,7 @@ class PageRouter:
             recall = word_recall(base_text, result.markdown)
             if recall < self.settings.min_word_recall:
                 reasons.append(f"word recall {recall:.2f} < {self.settings.min_word_recall:.2f}")
-        for issue in table_issues(result.markdown):
-            reasons.append(issue)
+        reasons.extend(table_issues(result.markdown))
         return (not reasons, reasons)
 
     @staticmethod
@@ -301,10 +323,11 @@ class PageRouter:
         page.confidence = result.confidence
         page.attempts.append(f"{result.backend}: ok")
 
-    def _accept_provisional(self, page: RoutedPage, result: PageResult, reasons: list[str]) -> None:
+    @staticmethod
+    def _accept_provisional(page: RoutedPage, result: PageResult, reasons: list[str]) -> None:
         """Keep a gate-failing result only when its prose is complete: structure
         with a slightly broken table beats flattened cells, but dropped text
-        never beats the raw text layer."""
+        never beats the raw text layer. A later round may still replace it."""
         text_problem = any(r.startswith("word recall") or r == "empty output" for r in reasons)
         if text_problem:
             page.attempts.append(f"{result.backend}: kept {page.backend} output instead")
@@ -318,18 +341,29 @@ class PageRouter:
     def _finish(self, source_url, title, pages: dict[int, RoutedPage], t0, notes) -> RoutedDocument:
         ordered = [pages[p] for p in sorted(pages)]
         parts: list[str] = []
+        content_pages = 0
+        marker_reasons: list[str] = []
         for page in ordered:
             if page.page_class == PageClass.BLANK:
                 continue
             if looks_empty(page.markdown):
-                # A page we know carries text (scan, broken layer) or tried to
-                # parse must not vanish silently: leave a marker downstream can see.
-                if page.attempts or page.page_class in (PageClass.SCAN, PageClass.BROKEN_TEXT):
+                # A page known to carry text (scan, broken layer) or one an ML
+                # tier was tried on must not vanish silently.
+                if page.ml_attempted or page.page_class in (PageClass.SCAN, PageClass.BROKEN_TEXT):
                     reason = page.attempts[-1] if page.attempts else f"{page.page_class.value} page, no OCR tier"
                     parts.append(f"<!-- page {page.page_no + 1}: no text extracted ({reason}) -->")
+                    marker_reasons.append(f"page {page.page_no + 1}: {reason}")
                 continue
             parts.append(page.markdown)
-        markdown = "\n\n".join(parts).strip()
+            content_pages += 1
+        if content_pages == 0:
+            # Markers alone are not content. Return the empty string so the
+            # scraper's "too short" check rejects the document as it did before.
+            markdown = ""
+            if marker_reasons:
+                notes.append("no text extracted from any page: " + "; ".join(marker_reasons[:3]))
+        else:
+            markdown = "\n\n".join(parts).strip()
         if not title and ordered:
             # No metadata title: take a top-level heading from the first page only,
             # never from a later page (a section header is not the document title).

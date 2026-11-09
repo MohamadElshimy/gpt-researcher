@@ -3,6 +3,8 @@ escalation, fallbacks, budgets, deadlines, output assembly."""
 
 from __future__ import annotations
 
+import time
+
 import pymupdf
 import pytest
 
@@ -11,6 +13,7 @@ from gpt_researcher.scraper.pdf_router.backends import (
     BackendRegistry,
     BackendTimeout,
     BackendUnavailable,
+    PageResult,
 )
 from gpt_researcher.scraper.pdf_router.backends.plain import PlainPyMuPDFBackend
 from gpt_researcher.scraper.pdf_router.classify import PageClass
@@ -199,6 +202,29 @@ def test_task_timeout_is_clamped_to_the_document_deadline(pdf_builder):
     assert seen and all(t <= 5.0 for t in seen), seen  # sidecar kills the worker at the document deadline
 
 
+def test_queued_tasks_get_the_budget_left_when_they_start(pdf_builder):
+    pdf = pdf_builder("tt" + "tt")
+    registry_backends = [PlainPyMuPDFBackend(), FakeBackend("layout", 1, LAYOUT_HANDLES, default="")]
+    registry = BackendRegistry(registry_backends)
+    seen: list[float] = []
+
+    class SlowRecordingExecutor:
+        max_concurrency = 1  # second task is queued behind the first
+
+        def run(self, name, pdf_bytes, pages, timeout):
+            seen.append(timeout)
+            time.sleep(1.2)
+            return {p: PageResult(p, plain_text(pdf_bytes, p) + GOOD_TABLE, name) for p in pages}
+
+    router = PageRouter(
+        settings=RouterSettings(inline=True, light_timeout=30.0, doc_deadline=6.0, layout_run_size=2),
+        executor=SlowRecordingExecutor(),
+        registry=registry,
+    )
+    router.route(pdf)
+    assert len(seen) == 2 and seen[1] < seen[0] - 1.0, seen
+
+
 def test_no_new_ml_tasks_start_when_the_deadline_is_nearly_spent(pdf_builder):
     pdf = pdf_builder("t")
     layout = FakeBackend("layout", 1, LAYOUT_HANDLES, default=keep_text(pdf, GOOD_TABLE))
@@ -243,13 +269,55 @@ def test_docling_runs_in_contiguous_batches(pdf_builder):
     assert sorted(docling.calls) == [[0, 1], [3, 4]]
 
 
+def test_batch_sizes_come_from_settings_per_tier(pdf_builder):
+    pdf = pdf_builder("ssss" + "tttt")
+    layout = FakeBackend("layout", 1, LAYOUT_HANDLES, default=keep_text(pdf, GOOD_TABLE))
+    docling = FakeBackend("docling", 2, DOCLING_HANDLES, default=OCR_TEXT)
+    make_router(pdf, layout, docling, docling_run_size=3, layout_run_size=2).route(pdf)
+    assert sorted(docling.calls) == [[0, 1, 2], [3]]
+    assert sorted(layout.calls) == [[4, 5], [6, 7]]
+
+
+def test_marker_only_output_is_empty_content(pdf_builder):
+    pdf = pdf_builder("sss")
+    doc = make_router(pdf, None, None).route(pdf)  # no OCR-capable tier
+    assert doc.markdown == ""  # markers alone would pass the scraper's length check
+    assert any(n.startswith("no text extracted from any page") for n in doc.notes)
+    assert all("<!--" not in p.markdown for p in doc.pages)
+
+
+def test_markers_stay_when_other_pages_have_content(pdf_builder):
+    pdf = pdf_builder("ps")
+    doc = make_router(pdf, None, None).route(pdf)
+    assert "Section 0" in doc.markdown
+    assert "<!-- page 2: no text extracted (no enabled backend handles scan) -->" in doc.markdown
+
+
+def test_untriaged_empty_page_gets_no_marker(pdf_builder):
+    pdf = pdf_builder("ptb")  # third page blank but beyond the triage cap, so classed PLAIN
+    layout = FakeBackend("layout", 1, LAYOUT_HANDLES, default=keep_text(pdf, GOOD_TABLE))
+    doc = make_router(pdf, layout, max_triage_pages=2).route(pdf)
+    assert "<!--" not in doc.markdown
+
+
+def test_deadline_failures_are_not_escalated(pdf_builder):
+    pdf = pdf_builder("t")
+    layout = FakeBackend("layout", 1, LAYOUT_HANDLES, default=keep_text(pdf, GOOD_TABLE), delay=3.0)
+    docling = FakeBackend("docling", 2, DOCLING_HANDLES, default=keep_text(pdf, GOOD_TABLE))
+    doc = make_router(pdf, layout, docling, doc_deadline=1.2).route(pdf)
+    assert docling.calls == []
+    assert any("deadline" in a for a in doc.pages[0].attempts)
+    assert any(n.startswith("document deadline") for n in doc.notes)
+
+
 def test_disabled_tier_is_skipped(pdf_builder):
     pdf = pdf_builder("s")
     docling = FakeBackend("docling", 2, DOCLING_HANDLES, default=OCR_TEXT)
     doc = make_router(pdf, None, docling, docling_tier=False).route(pdf)
     assert docling.calls == []
     assert any("no enabled backend handles scan" in a for a in doc.pages[0].attempts)
-    assert doc.markdown.startswith("<!-- page 1: no text extracted")
+    assert doc.markdown == ""  # a marker alone is not content
+    assert any(n.startswith("no text extracted from any page") for n in doc.notes)
 
 
 def test_unavailable_backend_is_not_in_the_ladder(pdf_builder):
@@ -279,7 +347,9 @@ def test_encrypted_pdf_yields_empty_result_with_note(tmp_path):
 
 
 def test_non_pdf_bytes_raise(pdf_builder):
-    with pytest.raises(Exception):
+    # pymupdf raises FileDataError for bytes it cannot parse; the scraper turns
+    # that into the empty-result contract (see test_scraper_wiring).
+    with pytest.raises((pymupdf.FileDataError, RuntimeError, ValueError)):
         make_router(b"").route(b"this is not a pdf")
 
 

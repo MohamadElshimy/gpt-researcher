@@ -151,7 +151,7 @@ def table_cell_recall(gt_cells: list[str], extracted: str) -> tuple[float, float
     """(cells found inside Markdown table rows, cells found anywhere)."""
     if not gt_cells:
         return float("nan"), float("nan")
-    table_text = " " + " ".join(normalise(l) for l in extracted.splitlines() if l.strip().startswith("|")) + " "
+    table_text = " " + " ".join(normalise(line) for line in extracted.splitlines() if line.strip().startswith("|")) + " "
     full_text = " " + normalise(extracted) + " "
     in_tables = sum(1 for c in gt_cells if f" {c} " in table_text or c in table_text)
     anywhere = sum(1 for c in gt_cells if c in full_text)
@@ -159,8 +159,8 @@ def table_cell_recall(gt_cells: list[str], extracted: str) -> tuple[float, float
 
 
 def markdown_table_count(extracted: str) -> int:
-    return sum(1 for l in extracted.splitlines() if re.match(r"^\|[\s:\-|]+\|$", l.strip()))
+    return sum(1 for line in extracted.splitlines() if re.match(r"^\|[\s:\-|]+\|$", line.strip()))
 
 
 def heading_count(extracted: str) -> int:
-    return sum(1 for l in extracted.splitlines() if re.match(r"^#{1,6} ", l))
+    return sum(1 for line in extracted.splitlines() if re.match(r"^#{1,6} ", line))

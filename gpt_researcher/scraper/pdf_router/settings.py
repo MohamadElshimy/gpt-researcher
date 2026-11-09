@@ -9,8 +9,8 @@ scraper threads, ~15 sources per query).
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
-from typing import Mapping
 
 _PREFIX = "PDF_ROUTER_"
 
@@ -43,12 +43,15 @@ class RouterSettings:
     max_triage_pages: int = 150  # pages inspected; the rest stay plain
     doc_deadline: float = 180.0  # wall-clock budget for one PDF
     docling_run_size: int = 8  # contiguous pages per Docling call
+    layout_run_size: int = 4  # contiguous pages per layout-tier call (one PDF transfer per run)
 
     # --- triage thresholds (see classify.py for provenance) ---------------
     blank_max_chars: int = 10
     blank_max_image_cover: float = 0.02
     scan_max_chars: int = 30
     scan_min_image_cover: float = 0.25
+    scan_dominant_image_cover: float = 0.5  # a bitmap page with only a text stamp is still a scan
+    scan_dominant_max_chars: int = 300
     broken_text_bad_ratio: float = 0.10
     column_jump_rate: float = 0.20
     table_min_numeric_lines: int = 10
@@ -59,7 +62,7 @@ class RouterSettings:
     min_word_recall: float = 0.90
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> "RouterSettings":
+    def from_env(cls, env: Mapping[str, str] | None = None) -> RouterSettings:
         env = os.environ if env is None else env
         values = {}
         for f in fields(cls):

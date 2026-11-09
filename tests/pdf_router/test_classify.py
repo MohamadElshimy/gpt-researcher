@@ -95,6 +95,14 @@ def test_classify_signals(signals, expected):
     assert classify_signals(signals, S) == expected
 
 
+def test_scan_with_text_stamp_is_still_a_scan(pdf_builder):
+    pdf = pdf_builder("S")
+    with pymupdf.open(stream=pdf, filetype="pdf") as doc:
+        tri = triage_page(doc[0], S)
+    assert tri.page_class == PageClass.SCAN
+    assert 30 <= tri.signals.chars < 300 and tri.signals.image_cover > 0.5
+
+
 def test_thresholds_come_from_settings():
     strict = RouterSettings(table_min_numeric_lines=2)
     assert classify_signals(_sig(numeric_lines=3), strict) == PageClass.TABLE

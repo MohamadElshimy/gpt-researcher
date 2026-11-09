@@ -20,7 +20,7 @@ tier (see DECISIONS.md).
 from __future__ import annotations
 
 import importlib.util
-from typing import Sequence
+from collections.abc import Sequence
 
 import pymupdf
 

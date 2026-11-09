@@ -3,3 +3,8 @@ output/
 
 # Secrets are loaded at runtime through docker-compose env_file or `docker run --env-file`, never baked into images :-)
 .env
+
+# Local virtualenvs and caches must never enter the build context (multi-GB with Docling).
+.venv*/
+venv/
+**/__pycache__/

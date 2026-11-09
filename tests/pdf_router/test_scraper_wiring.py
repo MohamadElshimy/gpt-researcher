@@ -3,7 +3,6 @@ the downloaded bytes to the router; nothing is written to disk."""
 
 from __future__ import annotations
 
-import glob
 import os
 import tempfile
 from unittest.mock import patch
@@ -42,13 +41,17 @@ def routed(markdown="# Title\n\nbody " * 30, title="Doc Title", notes=None) -> R
     )
 
 
-def _temp_pdfs() -> set:
-    return set(glob.glob(os.path.join(tempfile.gettempdir(), "*.pdf")))
+def _forbid_tempfiles(monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("scraper must not write temp files")
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", boom)
+    monkeypatch.setattr(tempfile, "mkstemp", boom)
 
 
-def test_url_download_is_passed_to_router_as_bytes(fixtures_dir):
+def test_url_download_is_passed_to_router_as_bytes(fixtures_dir, monkeypatch):
+    _forbid_tempfiles(monkeypatch)
     data = (fixtures_dir / "scanned-page.pdf").read_bytes()
-    before = _temp_pdfs()
     with patch(f"{MODULE}.requests.get", return_value=_FakeResponse(data)) as get, patch(
         f"{MODULE}.route_pdf_detailed", return_value=routed()
     ) as route:
@@ -59,14 +62,14 @@ def test_url_download_is_passed_to_router_as_bytes(fixtures_dir):
     passed_bytes, passed_url = route.call_args.args
     assert passed_bytes == data and passed_url == "https://example.com/paper.pdf"
     assert content.startswith("# Title") and images == [] and title == "Doc Title"
-    assert _temp_pdfs() == before  # no temp files any more
 
 
 def test_local_path_is_read_and_routed(fixtures_dir):
     path = str(fixtures_dir / "scanned-page.pdf")
     with patch(f"{MODULE}.route_pdf_detailed", return_value=routed(title="")) as route:
         content, images, title = PyMuPDFScraper(path).scrape()
-    assert route.call_args.args[0] == open(path, "rb").read()
+    with open(path, "rb") as f:
+        assert route.call_args.args[0] == f.read()
     assert content and images == [] and title == ""
 
 
@@ -114,6 +117,15 @@ def test_empty_router_output_sets_failure_reason():
         scraper = PyMuPDFScraper("https://example.com/enc.pdf")
         assert scraper.scrape() == ("", [], "")
     assert "encrypted" in scraper.failure_reason
+
+
+def test_bad_router_setting_does_not_break_downloads(monkeypatch):
+    monkeypatch.setenv("PDF_ROUTER_MAX_PDF_BYTES", "not-a-number")
+    with patch(f"{MODULE}.requests.get", return_value=_FakeResponse(b"%PDF-1.4 x")), patch(
+        f"{MODULE}.route_pdf_detailed", return_value=routed()
+    ):
+        content, _, _ = PyMuPDFScraper("https://example.com/a.pdf").scrape()
+    assert content.startswith("# Title")
 
 
 def test_is_url():

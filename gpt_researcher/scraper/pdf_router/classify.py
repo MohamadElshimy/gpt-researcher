@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 import pymupdf
 
@@ -30,7 +30,7 @@ from .settings import RouterSettings
 _NUMERIC_LINE = re.compile(r"^[\d.,%±\-–—/()\s]+$")
 
 
-class PageClass(str, Enum):
+class PageClass(StrEnum):
     BLANK = "blank"
     PLAIN = "plain"  # single column or column-major stream; no structure to recover
     MULTI_COLUMN = "multi_column"  # content stream is row-major across columns
@@ -105,7 +105,7 @@ def compute_signals(page: pymupdf.Page) -> PageSignals:
     # OCR'd PDFs). Column-major streams only jump once per column, and those
     # two lines never share a row.
     jumps = 0
-    for prev, cur in zip(lines, lines[1:]):
+    for prev, cur in zip(lines, lines[1:], strict=False):
         if abs(cur.x0 - prev.x0) > 0.3 * width and min(prev.y1, cur.y1) - max(prev.y0, cur.y0) > 0:
             jumps += 1
     jump_rate = jumps / (len(lines) - 1) if len(lines) > 1 else 0.0
@@ -143,6 +143,10 @@ def classify_signals(signals: PageSignals, settings: RouterSettings) -> PageClas
     if s.chars < settings.blank_max_chars and s.image_cover < settings.blank_max_image_cover:
         return PageClass.BLANK
     if s.chars < settings.scan_max_chars and s.image_cover >= settings.scan_min_image_cover:
+        return PageClass.SCAN
+    if s.image_cover >= settings.scan_dominant_image_cover and s.chars < settings.scan_dominant_max_chars:
+        # A page-sized bitmap carrying only a download stamp or DOI line is a
+        # scan; routing it as a figure would keep the stamp and lose the page.
         return PageClass.SCAN
     if s.chars >= settings.scan_max_chars and s.bad_ratio >= settings.broken_text_bad_ratio:
         return PageClass.BROKEN_TEXT

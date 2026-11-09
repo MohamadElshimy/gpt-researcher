@@ -8,8 +8,9 @@ worker process. Adding a parser means one class plus one registry entry.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, Sequence, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from ..classify import PageClass
 

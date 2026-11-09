@@ -34,14 +34,17 @@ def _prose_page(page: pymupdf.Page, seed: str) -> None:
     page.insert_textbox(pymupdf.Rect(50, 50, 545, 400), text, fontsize=10)
 
 
-def _scan_page(page: pymupdf.Page) -> None:
+def _scan_page(page: pymupdf.Page, stamp: str | None = None) -> None:
     pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 120, 160), False)
     pix.clear_with(230)
     page.insert_image(page.rect, pixmap=pix)
+    if stamp:
+        page.insert_text((40, 820), stamp, fontsize=7)
 
 
 def build_pdf(spec: str, title: str | None = None) -> bytes:
-    """Build a PDF from a spec string: one char per page, p=prose, t=table, s=scan, b=blank."""
+    """Build a PDF from a spec string: one char per page, p=prose, t=table,
+    s=scan, S=scan with a download stamp (~100 chars of text), b=blank."""
     doc = pymupdf.open()
     for index, kind in enumerate(spec):
         page = doc.new_page(width=595, height=842)
@@ -51,6 +54,8 @@ def build_pdf(spec: str, title: str | None = None) -> bytes:
             _numeric_table_page(page)
         elif kind == "s":
             _scan_page(page)
+        elif kind == "S":
+            _scan_page(page, "Downloaded from https://repository.example.edu on 2026-11-09. Authorized licensed use limited to: Example University.")
         elif kind == "b":
             pass
         else:

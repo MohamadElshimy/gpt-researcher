@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Callable, Sequence
+from collections.abc import Callable, Sequence
 
 from gpt_researcher.scraper.pdf_router.backends import BackendRegistry, PageResult
 from gpt_researcher.scraper.pdf_router.backends.plain import PlainPyMuPDFBackend
@@ -31,7 +31,7 @@ class FakeBackend:
         error: Exception | None = None,
         available: bool = True,
         delay: float = 0.0,
-        batch_pages: int = 1,
+        batch_pages: int | None = None,  # None: the router applies its per-tier setting
     ):
         self.name = name
         self.tier = tier
@@ -103,6 +103,22 @@ class CrashBackend:
         os._exit(3)  # simulate a native crash: no exception, the process just dies
 
 
+class ChildTimeoutBackend:
+    """Raises BackendTimeout inside the child, as a backend's own watchdog would."""
+
+    name = "childtimeout"
+    tier = 2
+    handles = ALL_CLASSES
+
+    def available(self):
+        return True
+
+    def parse(self, pdf_bytes, page_numbers):
+        from gpt_researcher.scraper.pdf_router.backends import BackendTimeout
+
+        raise BackendTimeout("backend-level timeout from the child")
+
+
 class RaisingBackend:
     name = "raising"
     tier = 2
@@ -116,7 +132,7 @@ class RaisingBackend:
 
 
 def registry() -> BackendRegistry:
-    return BackendRegistry([PlainPyMuPDFBackend(), EchoBackend(), SleepBackend(), CrashBackend(), RaisingBackend()])
+    return BackendRegistry([PlainPyMuPDFBackend(), EchoBackend(), SleepBackend(), CrashBackend(), RaisingBackend(), ChildTimeoutBackend()])
 
 
 def broken_registry() -> BackendRegistry:

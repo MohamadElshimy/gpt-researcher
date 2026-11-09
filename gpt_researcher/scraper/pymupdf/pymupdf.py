@@ -76,7 +76,11 @@ class PyMuPDFScraper:
 
     # ------------------------------------------------------------------ fetch
     def _fetch_bytes(self) -> bytes:
-        limit = RouterSettings.from_env().max_pdf_bytes
+        try:
+            limit = RouterSettings.from_env().max_pdf_bytes
+        except ValueError as e:  # a malformed PDF_ROUTER_* value must not break downloads
+            logger.warning("Invalid PDF router setting, using defaults: %s", e)
+            limit = RouterSettings().max_pdf_bytes
         if not self.is_url():
             with open(self.link, "rb") as f:
                 data = f.read(limit + 1)

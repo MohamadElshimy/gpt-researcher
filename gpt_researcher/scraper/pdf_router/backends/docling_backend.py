@@ -14,11 +14,12 @@ process when the task timeout expires.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import io
 import math
 import threading
-from typing import Sequence
+from collections.abc import Sequence
 
 from ..classify import PageClass
 from ..settings import RouterSettings
@@ -53,7 +54,10 @@ class DoclingBackend:
             if cls._converter is None:
                 from docling.datamodel.base_models import InputFormat
                 from docling.datamodel.pipeline_options import PdfPipelineOptions
-                from docling.document_converter import DocumentConverter, PdfFormatOption
+                from docling.document_converter import (
+                    DocumentConverter,
+                    PdfFormatOption,
+                )
 
                 settings = RouterSettings.from_env()
                 options = PdfPipelineOptions()
@@ -100,8 +104,6 @@ class DoclingBackend:
                     confidence=float(score) if score is not None else None,
                     notes=notes,
                 )
-            try:
+            with contextlib.suppress(Exception):
                 result.input.release()  # free parser buffers early (docling >= 2.145)
-            except Exception:
-                pass
         return results

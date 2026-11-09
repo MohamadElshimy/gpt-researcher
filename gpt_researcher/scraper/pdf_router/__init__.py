@@ -11,7 +11,13 @@ from __future__ import annotations
 import threading
 
 from .classify import PageClass, PageSignals, PageTriage, triage_page
-from .router import BackendExecutor, InlineExecutor, PageRouter, RoutedDocument, RoutedPage
+from .router import (
+    BackendExecutor,
+    InlineExecutor,
+    PageRouter,
+    RoutedDocument,
+    RoutedPage,
+)
 from .settings import RouterSettings
 
 __all__ = [
@@ -35,23 +41,27 @@ _router_lock = threading.Lock()
 
 
 def get_router(settings: RouterSettings | None = None) -> PageRouter:
-    """Process-wide router. Sidecar pools are shared by every scraper thread so
-    the worker counts act as global caps on ML work."""
+    """Process-wide router built from the environment on first use. Sidecar
+    pools are shared by every scraper thread so the worker counts act as
+    global caps on ML work. Passing ``settings`` builds a separate router with
+    those settings (tests, evaluation); it still shares the global pools unless
+    ``settings.inline`` is set."""
     global _router
-    if _router is None or settings is not None:
+    if settings is not None:
+        return _build_router(settings)
+    if _router is None:
         with _router_lock:
-            if _router is None or settings is not None:
-                settings = settings or RouterSettings.from_env()
-                if settings.inline:
-                    router = PageRouter(settings=settings)
-                else:
-                    from .workers import get_pooled_executor
-
-                    router = PageRouter(settings=settings, executor=get_pooled_executor(settings))
-                if _router is None:
-                    _router = router
-                return router
+            if _router is None:
+                _router = _build_router(RouterSettings.from_env())
     return _router
+
+
+def _build_router(settings: RouterSettings) -> PageRouter:
+    if settings.inline:
+        return PageRouter(settings=settings)
+    from .workers import get_pooled_executor
+
+    return PageRouter(settings=settings, executor=get_pooled_executor(settings))
 
 
 def route_pdf(pdf_bytes: bytes, source_url: str = "", settings: RouterSettings | None = None) -> str:

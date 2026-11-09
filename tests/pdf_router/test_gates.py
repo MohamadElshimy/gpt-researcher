@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from gpt_researcher.scraper.pdf_router.gates import looks_empty, markdown_tables, table_issues, word_recall
+from gpt_researcher.scraper.pdf_router.gates import (
+    looks_empty,
+    markdown_tables,
+    table_issues,
+    word_recall,
+)
 
 GOOD_TABLE = """Some prose before the table.
 
@@ -50,13 +55,50 @@ def test_garbled_side_by_side_table_is_flagged():
     assert "fragmented header" in joined
     assert "orphan punctuation" in joined
     assert "repeated header labels" in joined
-    assert "split word" in joined
+    assert "split" in joined
 
 
-def test_ragged_table_is_flagged():
+def test_split_text_table_is_flagged_but_not_as_ragged():
+    # Every row of RAGGED_TABLE is 11 cells wide once empty corner cells are kept.
     issues = table_issues(RAGGED_TABLE)
-    assert any("ragged rows" in i for i in issues)
+    assert not any("ragged rows" in i for i in issues), issues
     assert any("split across cells" in i for i in issues)
+
+
+def test_truly_ragged_table_is_flagged():
+    table = "|A|B|C|\n|---|---|---|\n|1|2|\n|3|4|5|6|\n|7|8|\n"
+    assert any("ragged rows" in i for i in table_issues(table))
+
+
+def test_empty_corner_cells_are_kept():
+    rows = markdown_tables("||Dev|Test|\n|---|---|---|\n|BERT|81.6|-|\n")[0]
+    assert rows[0] == ["", "Dev", "Test"]
+    assert [len(r) for r in rows] == [3, 3]
+    assert table_issues("||Dev|Test|\n|---|---|---|\n|BERT|81.6|-|\n") == []
+
+
+def test_dash_only_data_rows_are_not_separators():
+    rows = markdown_tables("|A|B|\n|---|---|\n|-|-|\n|1|2|\n")[0]
+    assert len(rows) == 3  # header + "-" row + data row
+
+
+def test_two_line_cells_are_not_split_words():
+    assert table_issues("|Answer|Score|\n|---|---|\n|Yes<br>No|1.0|\n|EM<br>F1|2.0|\n") == []
+
+
+def test_short_lowercase_header_abbreviations_are_not_split_text():
+    table = "|bsz|steps|lr|ppl|MNLI-m|\n|---|---|---|---|---|\n|256|1M|1e-4|3.99|84.7|\n|2K|125K|7e-4|3.68|85.2|\n"
+    assert table_issues(table) == []
+
+
+def test_spanning_row_cut_into_cells_is_flagged():
+    table = "|Model|SQuAD|MNLI|\n|---|---|---|\n|Our reimplementation|(without NSP los|s):|\n|FULL-SENTENCES|90.4/79.1|84.7|\n"
+    assert any("split across cells" in i for i in table_issues(table))
+
+
+def test_word_broken_across_cells_is_flagged():
+    assert any("split across cells" in i for i in table_issues("|Status|Dev|\n|---|---|\n|Publishe|d|\n"))
+    assert any("split word" in i for i in table_issues("|Status|Dev|\n|---|---|\n|Publishe<br>d|85.6|\n"))
 
 
 def test_short_lowercase_headers_are_not_split_text():

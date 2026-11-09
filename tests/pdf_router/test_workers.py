@@ -16,7 +16,12 @@ from gpt_researcher.scraper.pdf_router.backends import (
     BackendUnavailable,
 )
 from gpt_researcher.scraper.pdf_router.settings import RouterSettings
-from gpt_researcher.scraper.pdf_router.workers import MLWorkerPool, PooledExecutor, WorkerStartupError
+from gpt_researcher.scraper.pdf_router.workers import (
+    CircuitBreaker,
+    MLWorkerPool,
+    PooledExecutor,
+    WorkerStartupError,
+)
 
 from .fake_backends import registry as fake_registry
 
@@ -25,7 +30,7 @@ pytestmark = pytest.mark.timeout(180)
 FACTORY = "tests.pdf_router.fake_backends:registry"
 BROKEN_FACTORY = "tests.pdf_router.fake_backends:broken_registry"
 DYING_FACTORY = "tests.pdf_router.fake_backends:dying_registry"
-BACKENDS = ("echo", "sleep", "crash", "raising")
+BACKENDS = ("echo", "sleep", "crash", "raising", "childtimeout")
 
 
 def make_pool(size=1, **settings) -> MLWorkerPool:
@@ -103,6 +108,70 @@ def test_circuit_breaker_opens_after_consecutive_failures_and_probes_after_reset
         assert pool.breaker("crash").is_open
         # Other backends in the same pool are unaffected.
         assert pool.run("echo", b"", [0], timeout=30)
+    finally:
+        pool.shutdown()
+
+
+def test_child_side_backend_timeout_keeps_its_type_and_counts_as_failure():
+    pool = make_pool(breaker_failures=5)
+    try:
+        with pytest.raises(BackendTimeout, match="backend-level timeout"):
+            pool.run("childtimeout", b"", [0], timeout=30)
+        assert pool.breaker("childtimeout").consecutive == 1
+    finally:
+        pool.shutdown()
+
+
+def test_shutdown_kills_busy_workers_and_never_goes_negative():
+    import threading
+
+    pool = make_pool()
+    outcome: list = []
+
+    def long_task():
+        try:
+            pool.run("sleep", b"", [30], timeout=60)
+        except BackendError as exc:
+            outcome.append(type(exc).__name__)
+
+    t = threading.Thread(target=long_task)
+    t.start()
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not pool._busy:  # wait until the worker is really mid-task
+        time.sleep(0.05)
+    assert pool.live_workers == 1
+    pool.shutdown()
+    t.join(10)
+    assert not t.is_alive()
+    # Killed mid-task (crash/timeout) or, if shutdown raced the spawn, refused: never a hang, never a result.
+    assert outcome and outcome[0] in ("BackendCrashed", "BackendTimeout", "BackendUnavailable")
+    assert pool.live_workers == 0
+
+
+def test_breaker_probe_is_a_lease():
+    breaker = CircuitBreaker(failures=1, reset_seconds=0.2)
+    breaker.record_failure()
+    assert breaker.is_open and not breaker.allow()
+    time.sleep(0.25)
+    assert breaker.allow()  # the half-open probe
+    assert not breaker.allow()  # only one probe at a time
+    breaker.cancel_probe()  # the prober could not get a worker
+    assert breaker.allow()  # the lease is back
+    time.sleep(0.25)
+    assert breaker.allow()  # an unreported probe expires after reset_seconds
+
+
+def test_breaker_not_stuck_when_acquire_fails_during_probe():
+    pool = make_pool(breaker_failures=1, breaker_reset=0.2)
+    try:
+        with pytest.raises(BackendCrashed):
+            pool.run("crash", b"", [0], timeout=30)
+        assert pool.breaker("crash").is_open
+        time.sleep(0.25)
+        pool.shutdown()  # acquiring a worker for the probe now fails
+        with pytest.raises(BackendUnavailable, match="shut down"):
+            pool.run("crash", b"", [0], timeout=30)
+        assert pool.breaker("crash").allow()  # probe lease was returned, breaker not wedged
     finally:
         pool.shutdown()
 
