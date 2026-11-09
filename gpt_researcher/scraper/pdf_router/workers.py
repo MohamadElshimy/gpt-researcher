@@ -158,6 +158,7 @@ class _Worker:
         try:
             status, payload = self.conn.recv()
         except (EOFError, OSError) as exc:
+            self.proc.join(1.0)  # reap so the exit code (or -signal) is available for the message
             code = self.proc.exitcode
             self.kill()
             raise BackendCrashed(f"{backend_name}: worker died (exit code {code})") from exc
@@ -180,9 +181,11 @@ class _Worker:
             pass
 
     def stop(self) -> None:
+        # Ask nicely first: a worker that exits on its own releases its native
+        # resources (torch/ONNX teardown takes a moment); kill only if it lingers.
         try:
             self.conn.send(None)
-            self.proc.join(1.0)
+            self.proc.join(3.0)
         except Exception:
             pass
         self.kill()
