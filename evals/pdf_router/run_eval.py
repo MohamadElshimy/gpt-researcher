@@ -6,6 +6,7 @@ truth where one exists.
     python -m evals.pdf_router.run_eval --pooled   # through the sidecar worker pools
     python -m evals.pdf_router.run_eval --offline  # cached ground truth only
     python -m evals.pdf_router.run_eval --sanity   # also show get_text(sort=True) to prove the metric sees interleaving
+    python -m evals.pdf_router.run_eval --all-docling  # also score Docling on every page: the quality/cost upper bound
 
 Ground truth: ar5iv's HTML rendering of the two arXiv papers (fetched into
 ``--gt-cache``, not committed) and the reading-order text written next to the
@@ -93,6 +94,11 @@ def main(argv=None) -> int:
     parser.add_argument("--offline", action="store_true", help="never fetch ground truth")
     parser.add_argument("--pooled", action="store_true", help="run ML tiers through the sidecar worker pools")
     parser.add_argument("--sanity", action="store_true", help="also score get_text(sort=True)")
+    parser.add_argument(
+        "--all-docling",
+        action="store_true",
+        help="also score Docling on every page (the 'no router' upper bound on quality and cost)",
+    )
     parser.add_argument("--out-dir", type=Path, default=None, help="write extracted outputs here for inspection")
     parser.add_argument("--json", type=Path, default=None, help="write all numbers to this JSON file")
     args = parser.parse_args(argv)
@@ -146,6 +152,16 @@ def main(argv=None) -> int:
         }
         if args.sanity and name == "two-column-paper.pdf":
             entry["sorted_text_sanity"] = evaluate(name, sorted_extractor(pdf_bytes), gt_sentences, gt_cells)
+        if args.all_docling:
+            docling = router.registry.get("docling")
+            if docling.available():
+                t0 = time.perf_counter()
+                pages = docling.parse(pdf_bytes, range(len(routed.pages)))
+                all_docling = "\n\n".join(pages[p].markdown for p in sorted(pages))
+                entry["all_docling"] = {
+                    "seconds": round(time.perf_counter() - t0, 2),
+                    **evaluate(name, all_docling, gt_sentences, gt_cells),
+                }
         report[name] = entry
 
         if args.out_dir:
@@ -180,6 +196,8 @@ def main(argv=None) -> int:
         rows = [("previous", entry["previous"]), ("router", entry["router"])]
         if "sorted_text_sanity" in entry:
             rows.append(("sort=True (sanity)", entry["sorted_text_sanity"]))
+        if "all_docling" in entry:
+            rows.append(("docling on every page", entry["all_docling"]))
         for label, row in rows:
             backends = row.get("backends", "")
             if backends:
