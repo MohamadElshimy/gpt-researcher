@@ -14,7 +14,7 @@ Licensing note: the standalone ``pymupdf-layout`` 1.x wheels were "Polyform
 Noncommercial or Artifex Commercial"; in 2.x the same code ships under the
 pymupdf wheel's "AGPL-3.0 or Artifex Commercial" metadata with its source
 absent from the public repo. ``PDF_ROUTER_LAYOUT_TIER=false`` removes this
-tier (see DECISIONS.md).
+tier (see DECISIONS-DETAILED.md).
 """
 
 from __future__ import annotations

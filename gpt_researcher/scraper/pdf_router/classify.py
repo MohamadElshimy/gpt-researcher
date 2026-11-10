@@ -5,14 +5,14 @@ One ``get_text("dict")`` (images excluded), one ``get_image_info()`` and one
 deliberately not used -- it costs 100-300 ms per page and, since pymupdf 2.x,
 runs the layout model by default.
 
-Threshold provenance (see DECISIONS.md):
+Threshold provenance (see DECISIONS.md and DECISIONS-DETAILED.md):
 - scan / blank: Artifex "triage your documents" post (chars < 30 and image
   cover >= 25% -> OCR; chars < 10 and cover < 2% -> skip); MinerU uses
   < 50 chars/page; Tika ``ocrStrategy=auto`` uses < 10 chars.
 - broken text layer: Artifex ``BAD_CHAR_THRESHOLD = 0.10`` (share of U+FFFD);
   Tika "> 10 unmapped glyphs"; Kreuzberg >= 5 U+FFFD.
 - column jump rate and numeric-line count: measured on the fixture pack, see
-  the table in DECISIONS.md (synthetic row-major page 0.92 vs <= 0.06 on every
+  the table in DECISIONS-DETAILED.md (synthetic row-major page 0.92 vs <= 0.06 on every
   real page; table pages 12-73 numeric lines vs <= 8 on prose).
 """
 

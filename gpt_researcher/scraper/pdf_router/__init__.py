@@ -3,7 +3,8 @@
 ``route_pdf(pdf_bytes, source_url)`` inspects every page, sends each to the
 cheapest backend that can handle it (plain PyMuPDF -> PyMuPDF layout mode ->
 Docling), gates the results and returns one Markdown string in page order.
-See DECISIONS.md at the repository root for the design and its evidence.
+See DECISIONS.md at the repository root for the design, and DECISIONS-DETAILED.md
+for the full evidence behind it.
 """
 
 from __future__ import annotations
